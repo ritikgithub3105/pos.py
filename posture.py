@@ -7,7 +7,12 @@ import base64
 import io
 from PIL import Image
 
-app = Flask(__name__)
+@app.route('/')
+def index():
+    return "✅ Posture Detection API is running. Use the /detect-posture endpoint to POST base64 images."
+
+
+app = Flask(_name_)
 CORS(app)  # You can add specific origins if needed
 
 mp_pose = mp.solutions.pose
@@ -178,5 +183,5 @@ def detect_posture():
     except Exception as e:
         return jsonify({'error': str(e), 'success': False}), 500
 
-if __name__ == '__main__':
-    app.run(debug=False, port=5002, host='0.0.0.0')
+if _name_ == '_main_':
+    app.run(debug=False, port=5002, host='0.0.0.0')
