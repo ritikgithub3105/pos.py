@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import cv2
 import mediapipe as mp
@@ -6,22 +6,26 @@ import numpy as np
 import base64
 import io
 from PIL import Image
-
-@app.route('/')
-def index():
-    return "✅ Posture Detection API is running. Use the /detect-posture endpoint to POST base64 images."
-
+try:
+    from picamera import PiCamera
+    PICAMERA_AVAILABLE = True
+except ImportError:
+    PICAMERA_AVAILABLE = False
+from io import BytesIO
 
 app = Flask(_name_)
-CORS(app)  # You can add specific origins if needed
+# Simple CORS configuration
+CORS(app, supports_credentials=True)
 
 mp_pose = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
 mp_drawing_styles = mp.solutions.drawing_styles
 
+# Visibility check function
 def visible(p, threshold=0.3):
     return p.visibility > threshold
 
+# Improved posture classification logic
 def classify_posture(landmarks):
     if landmarks is None:
         return "no person detected", 0
@@ -52,6 +56,7 @@ def classify_posture(landmarks):
     if vis_count < 5:
         return "no person detected", vis_count
 
+    # Orientation
     orientation = "unknown"
     ankles_y = [p.y for k, p in zip(['l_ankle', 'r_ankle'], [l_ankle, r_ankle]) if visible_parts[k]]
     hips_y = [p.y for k, p in zip(['l_hip', 'r_hip'], [l_hip, r_hip]) if visible_parts[k]]
@@ -71,63 +76,77 @@ def classify_posture(landmarks):
     elif ankles_y:
         orientation = "foot_first"
 
+    # Facing direction
     facing = "unknown"
     if visible_parts['l_shoulder'] and visible_parts['r_shoulder']:
         x_diff = abs(l_shoulder.x - r_shoulder.x)
         if x_diff < 0.05:
-            facing = "decubitus_left" if l_shoulder.x < r_shoulder.x else "decubitus_right"
+            facing = "decubitus_right" if l_shoulder.x < r_shoulder.x else "decubitus_left"
         elif visible_parts['nose']:
             mid_x = (l_shoulder.x + r_shoulder.x) / 2
-            facing = "prone" if nose.x < mid_x else "supine"
+            facing = "supine" if nose.x < mid_x else "prone"
     elif visible_parts['l_hip'] and visible_parts['r_hip']:
         x_diff = abs(l_hip.x - r_hip.x)
         if x_diff < 0.05:
-            facing = "decubitus_left" if l_hip.x < r_hip.x else "decubitus_right"
+            facing = "decubitus_right" if l_hip.x < r_hip.x else "decubitus_left"
 
     posture = "unknown"
-    if orientation != "unknown" and facing != "unknown":
-        posture = f"{orientation}_{facing}"
-    elif orientation != "unknown":
-        posture = orientation
+    if orientation != "unknown":
+        if facing in ["supine", "prone", "decubitus_right", "decubitus_left"]:
+            posture = f"{orientation}_{facing}"
+        else:
+            posture = orientation
 
     return posture, vis_count
 
-# Tracking variables
+# Global variables for stability tracking
 prev_posture = None
 stable_posture = None
 freeze_count = 0
 FREEZE_THRESHOLD = 10
 
 def draw_landmarks(image, landmarks):
+    # Convert to RGB for MediaPipe
     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    
+    # Draw the pose landmarks
     mp_drawing.draw_landmarks(
         image_rgb,
         landmarks,
         mp_pose.POSE_CONNECTIONS,
         landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style()
     )
+    
+    # Convert back to BGR
     return cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
 
 @app.route('/detect-posture', methods=['POST'])
 def detect_posture():
     global prev_posture, stable_posture, freeze_count
+    
     try:
+        # Get image data from request
         data = request.json
-        image_data = data['image'].split(',')[1]
+        image_data = data['image'].split(',')[1]  # Remove data URL prefix
         image_bytes = base64.b64decode(image_data)
-
+        
+        # Convert to numpy array
         image = Image.open(io.BytesIO(image_bytes))
         image_np = np.array(image)
+        
+        # Convert to BGR for OpenCV
         image_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
-
-        with mp_pose.Pose(static_image_mode=True, model_complexity=1,
+        
+        # Process with MediaPipe
+        with mp_pose.Pose(static_image_mode=True, model_complexity=1, 
                          min_detection_confidence=0.6, min_tracking_confidence=0.6) as pose:
             results = pose.process(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
-
+            
             if results.pose_landmarks:
                 landmarks = results.pose_landmarks.landmark
                 posture, vis_count = classify_posture(landmarks)
-
+                
+                # Stability check
                 if posture not in ["no person detected", "unknown"]:
                     if posture == prev_posture:
                         freeze_count += 1
@@ -141,8 +160,11 @@ def detect_posture():
                     freeze_count = 0
                     prev_posture = None
                     stable_posture = None
-
+                
+                # Draw landmarks on the image
                 annotated_image = draw_landmarks(image_bgr.copy(), results.pose_landmarks)
+                
+                # Add text overlays
                 cv2.putText(annotated_image, f"Posture: {posture}", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
@@ -153,12 +175,16 @@ def detect_posture():
                 if vis_count < 5 and posture != "no person detected":
                     cv2.putText(annotated_image, "Low Visibility!", (10, 90),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-
+                
+                # Convert annotated image to base64
                 _, buffer = cv2.imencode('.jpg', annotated_image)
                 annotated_image_base64 = base64.b64encode(buffer).decode('utf-8')
-
+                
+                # Use stable posture if available, otherwise use current posture
+                display_posture = stable_posture if stable_posture else posture
+                
                 return jsonify({
-                    'posture': stable_posture if stable_posture else posture,
+                    'posture': display_posture,
                     'current_posture': posture,
                     'stable_posture': stable_posture,
                     'visibility_count': vis_count,
@@ -167,10 +193,11 @@ def detect_posture():
                     'success': True
                 })
             else:
+                # Reset stability tracking when no person detected
                 freeze_count = 0
                 prev_posture = None
                 stable_posture = None
-
+                
                 return jsonify({
                     'posture': 'no person detected',
                     'current_posture': 'no person detected',
@@ -180,8 +207,21 @@ def detect_posture():
                     'annotated_image': None,
                     'success': True
                 }), 200
+                
     except Exception as e:
         return jsonify({'error': str(e), 'success': False}), 500
 
+@app.route('/capture', methods=['GET'])
+def capture_image():
+    if not PICAMERA_AVAILABLE:
+        return jsonify({'success': False, 'error': 'PiCamera module not available'}), 500
+    camera = PiCamera()
+    camera.resolution = (640, 480)
+    stream = BytesIO()
+    camera.capture(stream, format='jpeg')
+    camera.close()
+    stream.seek(0)
+    return send_file(stream, mimetype='image/jpeg')
+
 if _name_ == '_main_':
-    app.run(debug=False, port=5002, host='0.0.0.0')
+    app.run(debug=True, port=5002, host='0.0.0.0')
